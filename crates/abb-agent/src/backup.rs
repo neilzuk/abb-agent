@@ -46,6 +46,8 @@ pub enum Skip {
     /// Not selected by the task's source type.
     NotSelected,
     Swap,
+    /// Unallocated physical extents inside a supported LVM PV.
+    Unused,
 }
 
 /// What the task asks to back up (the ABB "source type").
@@ -145,6 +147,56 @@ fn plan(d: &Disk, volumes: &mut Vec<Partition>, sel: &Selection) -> Vec<Interval
     for p in &d.partitions {
         if p.offset > pos {
             out.push(gap(pos, p.offset));
+        }
+        if p.fs == Fs::Lvm
+            && let Some(mapped) = d.lvm_volumes.iter().find(|v| v.parent == p.name)
+        {
+            let v = &mapped.volume;
+            let pend = p.offset + p.length;
+            let vend = v.offset + v.length;
+            if !sel.selects(v) {
+                out.push(Interval {
+                    start: p.offset,
+                    end: pend,
+                    kind: 5,
+                    part: Some(p.clone()),
+                    source: Source::Excluded(Skip::NotSelected),
+                });
+            } else if unreadable(v).is_some() {
+                out.push(Interval {
+                    start: p.offset,
+                    end: pend,
+                    kind: 5,
+                    part: Some(p.clone()),
+                    source: Source::Excluded(Skip::Unsupported),
+                });
+            } else {
+                // The prefix contains the PV label and its sole metadata area. The validated LV
+                // begins at PE 0 and is one contiguous mapping; physical extents after it are
+                // unallocated and may safely become unused blocks in the image.
+                if p.offset < v.offset {
+                    out.push(Interval { start: p.offset, end: v.offset, kind: 2, part: Some(p.clone()), source: Source::Raw });
+                }
+                volumes.push(v.clone());
+                out.push(Interval {
+                    start: v.offset,
+                    end: vend,
+                    kind: 1,
+                    part: Some(v.clone()),
+                    source: Source::Vol(volumes.len() - 1),
+                });
+                if vend < pend {
+                    out.push(Interval {
+                        start: vend,
+                        end: pend,
+                        kind: 5,
+                        part: Some(p.clone()),
+                        source: Source::Excluded(Skip::Unused),
+                    });
+                }
+            }
+            pos = pend;
+            continue;
         }
         let vol = matches!(p.fs, Fs::Btrfs | Fs::Ext(_));
         let (kind, source) = if p.fs == Fs::Swap {
@@ -297,7 +349,7 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], transfer:
             }));
             // The server mounts every volume of the mount map to verify the new version: only
             // the volumes actually sent may be listed, or the version is marked as failed.
-            if !p.mount_path.is_empty() && skip_of(intervals, p).is_none() {
+            if p.fs != Fs::Lvm && !p.mount_path.is_empty() && skip_of(intervals, p).is_none() {
                 mount_map.insert(
                     p.mount_path.clone(),
                     json!({
@@ -321,6 +373,39 @@ fn spec(sess: &Session, disks: &[(Disk, Vec<Interval>)], used: &[u64], transfer:
                     }),
                 );
             }
+        }
+        // A supported LV is not a GPT partition, so it does not belong in `disk_layout`. Its
+        // physical image offset is nevertheless sufficient for ABB to mount and browse the
+        // contiguous ext filesystem, while bare-metal restore writes the original LVM PV.
+        for lv in &d.lvm_volumes {
+            let p = &lv.volume;
+            if p.mount_path.is_empty()
+                || !intervals.iter().any(|i| i.part.as_ref().is_some_and(|q| q.name == p.name) && matches!(i.source, Source::Vol(_)))
+            {
+                continue;
+            }
+            mount_map.insert(
+                p.mount_path.clone(),
+                json!({
+                    "alias_name": alias(p),
+                    "device_name": format!("/dev/{}", p.name),
+                    "disk_number": n,
+                    "fs_type": "",
+                    "guest_mount_point": "",
+                    "image_path": d.image_name(),
+                    "is_mbr": false,
+                    "is_primary_partition": false,
+                    "is_system": is_system(p),
+                    "length": p.length.to_string(),
+                    "mount_path": p.mount_path,
+                    "object_id": 0,
+                    "offset": p.offset.to_string(),
+                    "partition_number": p.number,
+                    "target_partition_number": -1,
+                    "valid_offset_length": true,
+                    "volume_uuid": p.fs_uuid,
+                }),
+            );
         }
         for p in unsupported(d, intervals) {
             unsupported_volumes.push(json!({ "alias": alias(p), "uuid": p.fs_uuid }));
@@ -1162,7 +1247,36 @@ mod tests {
     }
 
     fn disk(name: &str, parts: Vec<Partition>) -> Disk {
-        Disk { name: name.into(), image: name.into(), size: 4 << 30, sector_size: 512, layout: "GPT".into(), partitions: parts }
+        Disk {
+            name: name.into(),
+            image: name.into(),
+            size: 4 << 30,
+            sector_size: 512,
+            layout: "GPT".into(),
+            partitions: parts,
+            lvm_volumes: vec![],
+        }
+    }
+
+    #[test]
+    fn linear_lvm_ext_is_mapped_into_the_pv() {
+        let mut pv = part("zzsda3", 3, 1 << 30, Fs::Lvm, "");
+        pv.length = 3 << 30;
+        pv.mount_path = "/".into();
+        pv.mounts = vec!["/".into()];
+        let mut root = part("dm-0", 3, (1 << 30) + (1 << 20), Fs::Ext(4), "root-uuid");
+        root.length = 1 << 30;
+        root.mount_path = "/".into();
+        root.mounts = vec!["/".into()];
+        let mut d = disk("zzsda", vec![pv]);
+        d.lvm_volumes.push(crate::disk::LvmVolume { parent: "zzsda3".into(), volume: root.clone() });
+        let mut volumes = Vec::new();
+        let iv = plan(&d, &mut volumes, &Selection::WholeDevice);
+        let mapped: Vec<_> = iv.iter().filter(|i| i.start >= 1 << 30 && i.end <= 4 << 30).map(|i| i.source).collect();
+        assert_eq!(mapped, [Source::Raw, Source::Vol(0), Source::Excluded(Skip::Unused)]);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].device(), PathBuf::from("/dev/dm-0"));
+        assert!(is_bootable(&[(d, iv)]));
     }
 
     #[test]

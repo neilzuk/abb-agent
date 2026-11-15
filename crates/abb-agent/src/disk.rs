@@ -4,6 +4,7 @@
 use btrfs_image::device::Device;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const GUID_ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
 pub const GUID_BIOS_BOOT: &str = "21686148-6449-6E6F-744E-656564454649";
@@ -107,6 +108,21 @@ pub struct Disk {
     pub layout: String,
     /// Sorted by offset.
     pub partitions: Vec<Partition>,
+    /// Supported logical volumes mapped linearly inside an LVM partition. The partition table
+    /// still contains the LVM PV; these describe where a mounted filesystem's bytes live in it.
+    pub lvm_volumes: Vec<LvmVolume>,
+}
+
+/// One deliberately narrow LVM mapping: a single, linear LV starting at PE 0 in a PV with one
+/// metadata area. That is enough to preserve the PV metadata and place the filesystem bytes at
+/// their original disk offsets without having to interpret arbitrary device-mapper stacks.
+#[derive(Clone, Debug)]
+pub struct LvmVolume {
+    /// Kernel name of the GPT partition holding the PV (e.g. `sda3`).
+    pub parent: String,
+    /// The filesystem exposed by device-mapper. Its `offset` is the physical byte offset in the
+    /// disk image, while `device()` is the logical source read and frozen by the agent.
+    pub volume: Partition,
 }
 
 impl Disk {
@@ -139,6 +155,19 @@ pub fn label(d: &Disk) -> String {
 
 /// Disk containing partition `part` (e.g. "nvme0n1p2" → "nvme0n1").
 pub fn parent_disk(part: &str) -> std::io::Result<String> {
+    // Device-mapper devices do not have a partition parent of their own. Follow their sole
+    // slave first (linear LVM and dm-crypt); ambiguous multi-device stacks stay unsupported.
+    let slaves = Path::new("/sys/class/block").join(part).join("slaves");
+    if let Ok(entries) = fs::read_dir(slaves) {
+        let names: Vec<String> = entries
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        match names.as_slice() {
+            [only] => return parent_disk(only),
+            [] => {}
+            _ => return Err(std::io::Error::other(format!("{part}: spans more than one underlying device"))),
+        }
+    }
     let link = fs::canonicalize(Path::new("/sys/class/block").join(part))?;
     let parent = link.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
     match parent {
@@ -347,7 +376,148 @@ pub fn scan(name: &str) -> std::io::Result<Disk> {
         });
     }
     partitions.sort_by_key(|p| p.offset);
-    Ok(Disk { name: name.to_string(), image: name.to_string(), size, sector_size, layout: "GPT".into(), partitions })
+    let lvm_volumes = discover_lvm(&mut partitions, &mounts);
+    Ok(Disk {
+        name: name.to_string(),
+        image: name.to_string(),
+        size,
+        sector_size,
+        layout: "GPT".into(),
+        partitions,
+        lvm_volumes,
+    })
+}
+
+/// An integer printed by LVM with `--units b --nosuffix` (normally `1048576.00`).
+fn lvm_integer(s: &str) -> Option<u64> {
+    let (whole, fraction) = s.trim().split_once('.').unwrap_or((s.trim(), ""));
+    if !fraction.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    whole.parse().ok()
+}
+
+/// `(metadata area count, first physical extent byte)` from one `pvs` output line.
+fn parse_pvs(line: &str) -> Option<(u64, u64)> {
+    let mut f = line.split_whitespace();
+    let count = lvm_integer(f.next()?)?;
+    let pe_start = lvm_integer(f.next()?)?;
+    f.next().is_none().then_some((count, pe_start))
+}
+
+/// A single linear device-mapper table: `(length, backing major:minor, backing offset)`, all
+/// offsets and lengths in 512-byte sectors.
+fn parse_dm_table(text: &str) -> Option<(u64, String, u64)> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let [line] = lines.as_slice() else { return None };
+    let mut f = line.split_whitespace();
+    let logical_start: u64 = f.next()?.parse().ok()?;
+    let length: u64 = f.next()?.parse().ok()?;
+    if logical_start != 0 || f.next()? != "linear" {
+        return None;
+    }
+    let backing = f.next()?.to_string();
+    let physical_start: u64 = f.next()?.parse().ok()?;
+    f.next().is_none().then_some((length, backing, physical_start))
+}
+
+fn command_output(program: &str, args: &[&str], device: Option<&Path>) -> std::io::Result<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).env("LC_ALL", "C");
+    if let Some(device) = device {
+        cmd.arg(device);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    String::from_utf8(out.stdout).map_err(std::io::Error::other)
+}
+
+/// Finds the one LVM layout the image code can reproduce safely: one PV metadata area, one
+/// device-mapper holder, and one linear segment beginning at PE 0. Anything more complicated
+/// remains an ordinary unsupported LVM partition.
+fn lvm_volume(p: &Partition, mounts: &[Mount]) -> std::io::Result<Option<LvmVolume>> {
+    let pdev = p.device();
+    let pvs = command_output(
+        "pvs",
+        &["--noheadings", "--units", "b", "--nosuffix", "-o", "pv_mda_count,pe_start"],
+        Some(&pdev),
+    )?;
+    let rows: Vec<&str> = pvs.lines().filter(|l| !l.trim().is_empty()).collect();
+    let [row] = rows.as_slice() else { return Ok(None) };
+    let Some((1, pe_start)) = parse_pvs(row) else { return Ok(None) };
+
+    let holders = Path::new("/sys/class/block").join(&p.name).join("holders");
+    let holders: Vec<String> = fs::read_dir(holders)?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    let [dm] = holders.as_slice() else { return Ok(None) };
+    if !dm.starts_with("dm-") {
+        return Ok(None);
+    }
+    let dmsys = Path::new("/sys/class/block").join(dm);
+    let dm_name = read_trim(dmsys.join("dm/name"))?;
+    let table = command_output("dmsetup", &["table", &dm_name], None)?;
+    let Some((sectors, backing, physical_sector)) = parse_dm_table(&table) else { return Ok(None) };
+    if backing != read_trim(Path::new("/sys/class/block").join(&p.name).join("dev"))? {
+        return Ok(None);
+    }
+    let length = sectors.checked_mul(512).ok_or_else(|| std::io::Error::other("LVM length overflow"))?;
+    let physical = physical_sector.checked_mul(512).ok_or_else(|| std::io::Error::other("LVM offset overflow"))?;
+    if physical != pe_start || read_u64(dmsys.join("size"))?.checked_mul(512) != Some(length) {
+        return Ok(None);
+    }
+    let offset = p.offset.checked_add(physical).ok_or_else(|| std::io::Error::other("LVM offset overflow"))?;
+    if offset.checked_add(length).is_none_or(|end| end > p.offset + p.length) {
+        return Ok(None);
+    }
+
+    let dmdev = PathBuf::from("/dev").join(dm);
+    let dev = Device::open(&dmdev)?;
+    let (fs_kind, fs_uuid) = probe_fs(&dev, 0, length)?;
+    if !matches!(fs_kind, Fs::Ext(_)) {
+        return Ok(None);
+    }
+    let mine = mounts_of(mounts, &read_trim(dmsys.join("dev")).unwrap_or_default(), &dmdev);
+    let read_only = mine.iter().all(|m| m.super_options.split(',').any(|o| o == "ro"));
+    let mut targets: Vec<&str> = mine.iter().map(|m| m.target.as_str()).collect();
+    targets.sort_by_key(|t| (*t != "/", t.len()));
+    let volume = Partition {
+        name: dm.clone(),
+        number: p.number,
+        offset,
+        length,
+        type_guid: p.type_guid.clone(),
+        fs: fs_kind,
+        fs_uuid,
+        mount_path: targets.first().map(|t| t.to_string()).unwrap_or_default(),
+        mounts: targets.iter().map(|t| t.to_string()).collect(),
+        read_only,
+        busy: false,
+    };
+    Ok(Some(LvmVolume { parent: p.name.clone(), volume }))
+}
+
+fn discover_lvm(partitions: &mut [Partition], mounts: &[Mount]) -> Vec<LvmVolume> {
+    let mut out = Vec::new();
+    for p in partitions.iter().filter(|p| p.fs == Fs::Lvm) {
+        match lvm_volume(p, mounts) {
+            Ok(Some(v)) => out.push(v),
+            Ok(None) => {}
+            Err(e) => eprintln!("/dev/{}: LVM discovery: {e}", p.name),
+        }
+    }
+    // Make selection and restore metadata recognise which physical PV holds the system volume.
+    for p in partitions.iter_mut() {
+        let mine: Vec<&Partition> = out.iter().filter(|v| v.parent == p.name).map(|v| &v.volume).collect();
+        if let [v] = mine.as_slice() {
+            p.mount_path = v.mount_path.clone();
+            p.mounts = v.mounts.clone();
+            p.read_only = v.read_only;
+        }
+    }
+    out
 }
 
 fn guid(b: &[u8]) -> String {
@@ -492,5 +662,16 @@ mod tests {
         assert!(!p.in_use());
         p.read_only = false;
         assert!(p.in_use());
+    }
+
+    #[test]
+    fn parses_the_supported_lvm_reports() {
+        assert_eq!(parse_pvs("  1  1048576.00\n"), Some((1, 1 << 20)));
+        assert_eq!(parse_pvs("  2  1048576.00\n"), Some((2, 1 << 20)));
+        assert_eq!(parse_pvs("  1  1048576.50\n"), None);
+        assert_eq!(parse_dm_table("0 209715200 linear 8:3 2048\n"), Some((209715200, "8:3".into(), 2048)));
+        assert_eq!(parse_dm_table("1 209715200 linear 8:3 2048\n"), None);
+        assert_eq!(parse_dm_table("0 100 linear 8:3 2048\n100 100 linear 8:3 4096\n"), None);
+        assert_eq!(parse_dm_table("0 100 crypt aes 00 0 8:3 2048\n"), None);
     }
 }

@@ -139,6 +139,18 @@ fn main() {
                     p.attribute(),
                     p.mount_path
                 );
+                for lv in d.lvm_volumes.iter().filter(|v| v.parent == p.name) {
+                    let v = &lv.volume;
+                    println!(
+                        "    {:<14} {:>14} +{:>14} {:<6} {:<38} {:?}",
+                        v.name,
+                        v.offset,
+                        v.length,
+                        v.fs.name(),
+                        v.fs_uuid,
+                        v.mount_path
+                    );
+                }
             }
         }
         "bench" => {

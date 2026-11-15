@@ -26,8 +26,9 @@ no kernel module and no Synology binaries.
 | **btrfs** | ✅ | ✅ | single device, any subvolume layout (`@`, `@home`, snapper, btrbk…) |
 | **ext4** | ✅ | ✅ | mounted read-write too, the root filesystem included: frozen for an instant to capture the metadata |
 | **ext3**, **ext2** | ✅ | ✅ | as ext4 |
+| **LVM with one linear ext2/3/4 LV** | ✅ | ✅ | one PV, one metadata area, one LV starting at PE 0; the remaining free extents are left unused |
 | vfat (EFI system partition), BIOS boot | ✅ | ✅ | copied as they are; a mounted ESP that changes while read makes the backup partial |
-| XFS, LVM, LUKS, md-raid, multi-device btrfs | ❌ | | left out, the backup is reported as partial |
+| XFS, complex LVM, LUKS, md-raid, multi-device btrfs | ❌ | | left out, the backup is reported as partial |
 
 Disks must use GPT partition tables.
 
@@ -384,8 +385,10 @@ Things that do not work yet, or have not been tested:
   backup and bare-metal restore ([#6](https://github.com/rylos/abb-agent/issues/6)). Other
   distributions (Debian, Ubuntu, openSUSE…) and other ABB versions should work but have not been
   verified.
-- **Backup:** XFS, LVM, LUKS, md-raid and multi-device btrfs are left out of the image (the backup
-  is reported as partial). So is any other filesystem the agent does not read (NTFS, f2fs, exFAT…)
+- **Backup:** LVM is supported only for a single PV with one metadata area and one contiguous,
+  linear ext2/3/4 LV beginning at PE 0. Multiple PVs or LVs, striped/mirrored/thin/cache LVs and
+  LVs not beginning at PE 0 are left out. XFS, LUKS, md-raid and multi-device btrfs are left out
+  too (the backup is reported as partial). So is any other filesystem the agent does not read (NTFS, f2fs, exFAT…)
   while it is mounted read-write or held by the kernel; unmounted, it is copied as it is. MBR disks
   are not supported. btrfs quota groups are not updated for excluded subvolumes.
 - **Excluded btrfs subvolumes** are left out by editing their parent directory in the image. When
